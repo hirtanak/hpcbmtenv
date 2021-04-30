@@ -1,32 +1,34 @@
 #!/bin/bash
-# repositry: https://github.com/hirtanak/hpcbmtenv
+# Repositry: https://github.com/hirtanak/hpcbmtenv
 # Last update: 2021/4/30
 SCRIPTVERSION=0.3.0
 
-echo "startup azure delopment script..."
+echo "SCRIPTVERSION: $SCRIPTVERSION - startup azure hpc delopment create script..."
 
+### 基本設定
 MyResourceGroup=tmcbmt01
 Location=japaneast #southcentralus
 VMPREFIX=tmcbmt01
 VMSIZE=Standard_HB120rs_v2 #Standard_D2as_v4 #Standard_HC44rs, Standard_HB120rs_v3
 PBSVMSIZE=Standard_D8as_v4
-# ネットワーク設定
+MAXVM=2 # 作成するコンピュートノード数
+
+### ネットワーク設定
 MyAvailabilitySet=${VMPREFIX}avset01 #HPCクラスターのVMサイズ別に異なる可用性セットが必要。自動生成するように変更したため、基本変更しない
 MyNetwork=${VMPREFIX}-vnet01
 MySubNetwork=compute
-MySubNetwork2=management # ログインノード用
-ACCELERATEDNETWORKING="--accelerated-networking true" # もし問題がある場合にはNOで利用可能。コンピュートノードのみ対象 true/false
+MySubNetwork2=management # ログインノード用サブネット
+ACCELERATEDNETWORKING="--accelerated-networking true" # もし問題がある場合にはflaseで利用可能。コンピュートノードのみ対象 true/false
 MyNetworkSecurityGroup=${VMPREFIX}-nsg
 # MACアドレスを維持するためにNICを保存するかどうかの設定
 STATICMAC=false #true or false
+
+### ユーザ設定
 IMAGE="OpenLogic:CentOS-HPC:7_8:latest" #Azure URNフォーマット。OpenLogic:CentOS-HPC:8_1:latest
-# ユーザ名: デフォルト azureuser
-USERNAME=azureuser
-# SSH公開鍵ファイルを指定：デフォルトではカレントディレクトリを利用する
-SSHKEYFILE="./${VMPREFIX}.pub"
+USERNAME=azureuser # ユーザ名: デフォルト azureuser
+SSHKEYFILE="./${VMPREFIX}.pub" # SSH公開鍵ファイルを指定：デフォルトではカレントディレクトリを利用する
 TAG=${VMPREFIX}=$(date "+%Y%m%d")
-# 作成するコンピュートノード数
-MAXVM=2
+
 # 追加の永続ディスクが必要な場合、ディスクサイズ(GB)を記入する https://azure.microsoft.com/en-us/pricing/details/managed-disks/
 PERMANENTDISK=0
 PBSPERMANENTDISK=2048
@@ -38,7 +40,6 @@ PBSPERMANENTDISK=2048
 #azure_name="uuid"
 #azure_password="uuid"
 #azure_tenant="uuid"
-
 #az login --service-principal --username ${azure_name} --password ${azure_password} --tenant ${azure_tenant} --output none
 
 # デバックオプション: DEBUG="parallel -v"
@@ -106,22 +107,15 @@ echo "addtional accessible CIDR: $LIMITEDIP2"
 # 必要なパッケージ： GNU parallel, jq, curlのインストール。別途、azコマンドも必須
 if   [ -e /etc/debian_version ] || [ -e /etc/debian_release ]; then
     # Check Ubuntu or Debian
-    if [ -e /etc/lsb-release ]; then
-        # Ubuntu
-        echo "your linux distribution is: ubuntu"
+    if [ -e /etc/lsb-release ]; then echo "your linux distribution is: ubuntu";
 		sudo apt-get install -qq -y parallel jq curl || apt-get install -qq -y parallel jq curl
-    else
-        # Debian
-        echo "your linux distribution is: debian"
-		sudo apt-get install -qq -y parallel jq curl || apt-get install -qq -y parallel jq curl
+    else echo "your linux distribution is: debian";
+		if [[ $(hostname) =~ [a-z]*-*-*-* ]]; then echo "skipping...due to azure cloud shell";
+		else sudo apt-get install -qq -y parallel jq curl || apt-get install -qq -y parallel jq curl; fi
 	fi
-elif [ -e /etc/fedora-release ]; then
-    # Fedra
-    echo "your linux distribution is: fedora"
+elif [ -e /etc/fedora-release ]; then echo "your linux distribution is: fedora";
 	sudo yum install --quiet -y parallel jq curl || yum install -y parallel jq curl
-elif [ -e /etc/redhat-release ]; then
-	# RHEL or CentOS
-	echo "your linux distribution is: Redhat or CentOS"
+elif [ -e /etc/redhat-release ]; then echo "your linux distribution is: Redhat or CentOS"; 
 	sudo yum install --quiet -y parallel jq curl || yum install -y parallel jq curl
 fi
 
@@ -180,14 +174,27 @@ case $1 in
 					# 1 の場合、可用性セットは利用中
 					elif [ $((checkavsetnext)) -eq 1 ]; then
 						echo "${VMPREFIX}avset0${count} has already used."
-					fi
+					# 多数 の場合、一般SKUを利用。利用中か不明だが、既存可用性セットとして再利用可能
+					elif [ $((checkavsetnext)) -gt 5 ]; then
+						# check avset: ${VMPREFIX}avset01
+						checkavset2=$(az vm availability-set list-sizes --name ${VMPREFIX}avset01 -g $MyResourceGroup -o tsv | cut -f 3 | wc -l)
+						if [ $((checkavset2)) -gt 5 ]; then
+							echo "use existing availalibty set: ${VMPREFIX}avset01"
+							MyAvailabilitySet=${VMPREFIX}avset01
+							break
+						else
+							echo "${VMPREFIX}avset0${count} is belong to general sku."
+							MyAvailabilitySet="${VMPREFIX}avset0${count}"
+							az vm availability-set create --name "$MyAvailabilitySet" -g $MyResourceGroup -l $Location --tags "$TAG" --output none
+							break
+						fi
+					fi					
 					# 未使用の場合、すべてのサイズがリストされる. ex. 379　この可用性セットは利用可能
 				done
 			fi
 		fi
 
 		# VM作成
-		numvm=0
 		for count in $(seq 1 $MAXVM); do
 			# echo "creating nic # $count"
 			if [ ${STATICMAC} = "true" ]; then
@@ -196,7 +203,7 @@ case $1 in
 				# $ACCELERATEDNETWORKING: にはダブルクォーテーションはつけない
 				az vm create -g $MyResourceGroup -l $Location --name ${VMPREFIX}-${count} --size $VMSIZE --availability-set "$MyAvailabilitySet" --nics ${VMPREFIX}-${count}VMNic --image $IMAGE --admin-username $USERNAME --ssh-key-values $SSHKEYFILE --no-wait --tags "$TAG" -o none
 			fi
-			echo "creating VM # $count with MyAvailabilitySet: $MyAvailabilitySet"
+			echo "creating VM # $count with availability set: $MyAvailabilitySet"
 			# $ACCELERATEDNETWORKING: にはダブルクォーテーションはつけない
 			az vm create \
 				--resource-group $MyResourceGroup --location $Location \
@@ -259,13 +266,70 @@ case $1 in
 		# テンポラリファイル削除
 		rm ./tmpfile
 		rm ./tmpfile2
+		
 		# 永続ディスクが必要な場合に設定可能
 		if [ $((PERMANENTDISK)) -gt 0 ]; then
 			az vm disk attach --new -g $MyResourceGroup --size-gb $PERMANENTDISK --sku Premium_LRS --vm-name ${VMPREFIX}-1 --name ${VMPREFIX}-1-disk0 -o table
 		fi
+
+		# fstab設定
+		echo "setting fstab"
+		mountip=$(az vm show -g $MyResourceGroup --name ${VMPREFIX}-1 -d --query privateIps -otsv)
+		if [ ! -s ./checkfstab ]; then 
+			for count in $(seq 2 $MAXVM); do
+				line=$(sed -n "${count}"P ./ipaddresslist)
+				for cnt in $(seq 1 15); do
+					checkssh=$(ssh -o StrictHostKeyChecking=no -o 'ConnectTimeout 5' -i "${SSHKEYDIR}" -t $USERNAME@"${line}" "uname")
+					if [ -n "$checkssh" ]; then
+						break
+					fi
+					echo "waiting sshd @ ${VMPREFIX}-${count}: sleep 10" && sleep 10
+				done
+				if [ -n "$checkssh" ]; then
+					echo "${VMPREFIX}-${count}: configuring fstab by ssh"
+					ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@${line} -t -t "sudo sed -i -e '/azure_resource-part1/d' /etc/fstab"
+					ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@${line} -t -t 'sudo umount /dev/disk/cloud/azure_resource-part1'
+					# 重複していないかチェック
+					ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@${line} -t -t "sudo grep ${mountip}:/mnt/resource /etc/fstab" > checkfstab
+					checkfstab=$(cat checkfstab | wc -l)
+					if [ $((checkfstab)) -ge 2 ]; then 
+						echo "deleting dupulicated settings...."
+						ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "sudo sed -i -e '/${mountip}:\/mnt\/resource/d' /etc/fstab"
+						ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "sudo sed -i -e '$ a "${mountip}":/mnt/resource    /mnt/resource    xfs    defaults    0    0' /etc/fstab"
+					elif [ $((checkfstab)) -eq 1 ]; then
+						echo "correct fstab setting"
+					elif [ $((checkfstab)) -eq 0 ]; then
+						echo "fstab missing: no /mnt/resource here!"
+						ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "sudo sed -i -e '$ a "${mountip}":/mnt/resource    /mnt/resource    xfs    defaults    0    0' /etc/fstab"
+					fi
+				else
+					# fstab 設定: az vm run-command
+					echo "${VMPREFIX}-${count}: configuring fstab by az vm run-command"
+					az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript --scripts "sudo sed -i -e '/azure_resource-part1/d' /etc/fstab"
+					az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript --scripts 'sudo umount /dev/disk/cloud/azure_resource-part1'
+					# 重複していないかチェック
+					az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript --scripts "sudo grep "${mountip}:/mnt/resource" /etc/fstab" > checkfstab
+					checkfstab=$(cat checkfstab | wc -l)
+					if [ $((checkfstab)) -ge 2 ]; then 
+						echo "deleting dupulicated settings...."
+						az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript \
+							--scripts "sudo sed -i -e '/${mountip}:\/mnt\/resource/d' /etc/fstab"
+						az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript \
+							--scripts "sudo sed -i -e '$ a "${mountip}":/mnt/resource    /mnt/resource    xfs    defaults    0    0' /etc/fstab"
+					elif [ $((checkfstab)) -eq 1 ]; then
+						echo "correct fstab setting"
+					elif [ $((checkfstab)) -eq 0 ]; then
+						echo "fstab missing: no /mnt/resource here!"
+						az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript \
+							--scripts "sudo sed -i -e '$ a "${mountip}":/mnt/resource    /mnt/resource    xfs    defaults    0    0' /etc/fstab"
+					fi
+				fi
+			done
+		fi
+
 		echo "setting up nfs server"
 		vm1ip=$(head -n 1 ./ipaddresslist)
-			for count in $(seq 1 20); do
+			for count in $(seq 1 15); do
 				checkssh=$(ssh -o StrictHostKeyChecking=no -o 'ConnectTimeout 5' -i "${SSHKEYDIR}" -t $USERNAME@"${vm1ip}" "uname")
 				if [ -n "$checkssh" ]; then
 					break
@@ -282,7 +346,7 @@ case $1 in
 			az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-1 --command-id RunShellScript --scripts "sudo systemctl start rpcbind && sudo systemctl start nfs-server"
 			az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-1 --command-id RunShellScript --scripts "sudo systemctl enable rpcbind && sudo systemctl enable nfs-server"
 		else
-			# SSH設定が高速
+			# SSH設定が高速なため、checkssh が有効な場合、SSHで実施
 			echo "${VMPREFIX}-1: sudo 設定"
 			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${vm1ip}" -t -t "sudo cat /etc/sudoers | grep $USERNAME" > sudotmp
 			if [ -z "$sudotmp" ]; then
@@ -319,6 +383,7 @@ case $1 in
 				az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript --scripts "echo '$USERNAME ALL=NOPASSWD: ALL' | sudo tee -a /etc/sudoers"
 			fi
 		done
+
 		# 高速化のためにSSHで一括設定しておく
 		echo "ssh parallel settings: nfs client"
 		parallel -a ipaddresslist-tmp "ssh -o StrictHostKeyChecking=no -o 'ConnectTimeout 30' -i ${SSHKEYDIR} $USERNAME@{} -t -t "sudo yum install --quiet -y nfs-utils epel-release""
@@ -329,10 +394,9 @@ case $1 in
 		rm ./ipaddresslist-tmp
 		
 		# NFSサーバ・マウント設定
-		count=2
 		for count in $(seq 2 $MAXVM); do
 			line=$(sed -n "${count}"P ./ipaddresslist)
-			for cnt in $(seq 1 20); do
+			for cnt in $(seq 1 10); do
 				checkssh=$(ssh -o StrictHostKeyChecking=no -o 'ConnectTimeout 30' -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "uname")
 				if [ -n "$checkssh" ]; then
 					break
@@ -348,14 +412,6 @@ case $1 in
 				ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "sudo mkdir -p /mnt/resource"
 				ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "sudo chown $USERNAME:$USERNAME /mnt/resource"
 				ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "sudo mount $DEBUG -t nfs ${mountip}:/mnt/resource /mnt/resource"
-				# Check fstab settings
-				for count in $(seq 2 $MAXVM); do
-					line=$(sed -n "${count}"P ./ipaddresslist)
-					fstabsetting=$(ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${count}" -t -t "sudo grep '/mnt/resource /etc/fstab'")
-					if [ -z "${fstabsetting}" ]; then 
-						ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${count}" -t -t "echo '${mountip}:/mnt/resource    /mnt/resource    nfs    defaults    0    0' | sudo tee -a /etc/fstab"
-					fi
-				done
 			else
 				echo "${VMPREFIX}-2 to ${MAXVM}: ${count} setting by az vm run-command"
 				az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript --scripts 'sudo yum install --quiet -y nfs-utils epel-release'
@@ -364,18 +420,9 @@ case $1 in
 				az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript --scripts "sudo mkdir -p /mnt/resource"
 				az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript --scripts "sudo chown $USERNAME:$USERNAME /mnt/resource"
 				az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript --scripts "sudo mount $DEBUG -t nfs ${mountip}:/mnt/resource /mnt/resource"
-				# Check fstab settings
-				for count in $(seq 2 $MAXVM); do
-					line=$(sed -n "${count}"P ./ipaddresslist)
-					fstabsetting=$(az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript --scripts "sudo grep '/mnt/resource /etc/fstab'")
-					if [ -z "${fstabsetting}" ]; then 
-						az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --command-id RunShellScript \
-							--scripts "echo '${mountip}:/mnt/resource    /mnt/resource    xfs    defaults    0    0' | sudo tee -a /etc/fstab"
-					fi
-				done
 			fi
 		done
-		echo "end of mouting ${VMPREFIX}-1:/mnt/resource"
+		echo "end of mouting ${mountip}:/mnt/resource"
 		# SSHパスワードレスセッティング
 		echo "preparing for passwordless settings"
 		cat ./ipaddresslist
@@ -454,18 +501,17 @@ EOL
 		# ホストファイル作成
 		az vm list-ip-addresses -g $MyResourceGroup --query "[].virtualMachine.{VirtualMachine:name,PrivateIPAddresses:network.privateIpAddresses[0]}" -o tsv > tmphostsfile
 		# 自然な順番でソートする
-		sort -V ./tmphostsfile > tmphostsfile2
+		sort -V ./tmphostsfile > hostsfile
 		# vmlist 取り出し：1列目
-		cut -f 1 ./tmphostsfile2 > vmlist
+		cut -f 1 ./hostsfile > vmlist
 		# nodelist 取り出し：2列目
-		cut -f 2 ./tmphostsfile2 > nodelist
+		cut -f 2 ./hostsfile > nodelist
 		# ダブルクォーテーション削除: sed -i -e "s/\"//g" ./tmphostsfile
 		# ファイルの重複行削除。列は2列まで想定: cat  ./tmphostsfile2 | awk '!colname[$1]++{print $1, "\t", $2}' > ./hostsfile
 		echo "show current hostsfile"
 		cat ./hostsfile
 		# テンポラリファイル削除
 		rm ./tmphostsfile
-		rm ./tmphostsfile2
 ### ===========================================================================
 		# PBSノード：ホストファイル転送・更新
 		checkssh=$(ssh -o StrictHostKeyChecking=no -o 'ConnectTimeout 30' -i "${SSHKEYDIR}" -t $USERNAME@"${pbsvmip}" "uname")
@@ -495,7 +541,7 @@ EOL
 			az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-pbs --command-id RunShellScript --scripts "scp -o StrictHostKeyChecking=no -i /home/$USERNAME/${VMPREFIX} $USERNAME@${loginprivateip}:/home/$USERNAME/hostsfile /home/$USERNAME/"
 			echo "PBSノード: az: ホストファイル更新"
 			az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-pbs --command-id RunShellScript --scripts "sudo cp /etc/hosts.original /etc/hosts"
-			az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-pbs --command-id RunShellScript --scripts "cat /home/$USERNAME/hostsfile | sudo tee -a /etc/hosts"
+			# az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-pbs --command-id RunShellScript --scripts "cat /home/$USERNAME/hostsfile | sudo tee -a /etc/hosts"
 			az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-pbs --command-id RunShellScript --scripts "cat /etc/hosts"
 		fi
 		# コンピュートノード：ホストファイル転送・更新
@@ -713,29 +759,17 @@ EOL
 			sleep 5
 		done
 		rm ./tmpnumvm.txt
-		echo "checking VM public ip"
+
 		# ダイナミックの場合（デフォルト）、再度IPアドレスリストを作成しなおす
-		# コンピュートノードVM#1のパブリックIPが同じならスキップする
-		vm1ip=$(az vm show -d -g $MyResourceGroup --name ${VMPREFIX}-1 --query publicIps -o tsv)
-		echo "${VMPREFIX}-1's IP: $vm1ip"
-		prevm1ip=$(head -n 1 ./ipaddresslist)
-		if [ "$prevm1ip" !=  "$vm1ip" ]; then
-			echo "making new ipaddress list"
-			count=1
-			for count in $(seq 1 $MAXVM) ; do
-				echo "VM $count: ${VMPREFIX}-$count"
-				unset ipaddresstmp
-				while [ -z "$ipaddresstmp" ]; do
-					ipaddresstmp=$(az vm show -d -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --query publicIps -o tsv)
-					echo "ip: $ipaddresstmp"
-				done
-				echo "$ipaddresstmp" >> ipaddresslist
-			done
-			echo "new ipaddress list"
-			cat ./ipaddresslist
-		else
-			echo "not canage ipaddress list"
-		fi
+		echo "creating ipaddresslist"
+		az vm list-ip-addresses -g $MyResourceGroup --query "[].virtualMachine[].{Name:name, PrivateIPAddresses:network.privateIpAddresses[0], PublicIp:network.publicIpAddresses[0].ipAddress}" -o tsv > tmpfile
+		# 自然な順番でソートする
+		sort -V ./tmpfile > tmpfile2
+		# ipaddresslist 取り出し：3列目
+		echo "show new ipaddresslist"
+		cut -f 3 ./tmpfile2 > ipaddresslist
+		cat ./ipaddresslist
+
 		# コンピュートノードVM#1のマウントするプライベートIPの取得
 		mountip=$(az vm show -g $MyResourceGroup --name ${VMPREFIX}-1 -d --query privateIps -o tsv)
 		echo "${VMPREFIX}-1: nfs exports ip: $mountip"
@@ -902,6 +936,11 @@ EOL
 		done
 	;;
 	stop-all )
+		if [ -f ./tmposdiskidlist ]; then rm ./tmposdiskidlist; fi
+		for count in $(seq 1 $MAXVM) ; do
+			disktmp=$(az vm show -g $MyResourceGroup --name ${VMPREFIX}-"${count}" --query storageProfile.osDisk.managedDisk.id -o tsv)
+			echo "$disktmp" >> tmposdiskidlist
+		done
 		for count in $(seq 1 $MAXVM) ; do
 			echo "stoping VM $count"
 			az vm deallocate -g $MyResourceGroup --name ${VMPREFIX}-"${count}" &
@@ -1102,14 +1141,13 @@ EOL
 		rm ./pingponlist
 		rm ./nodelist
 		rm ./hostsfile
+		rm ./tmpcheckhostsfile
 		rm ./loginvmip
 		rm ./pbsvmip
 		rm ./md5*
-		rm ./hostsfile
 		rm ./openpbs*
 		rm ./pbsprivateip
 		rm ./loginpribateip
-		rm ./tmpcheckhostsfile
 	;;
 	deletevm )
 		# $2が必要
@@ -1449,27 +1487,86 @@ EOL
 		scp -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" ./config $USERNAME@"${pbsvmip}":/home/$USERNAME/.ssh/config
 		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "chmod 600 /home/$USERNAME/.ssh/config"
 		# PBSノード：sudo設定
-		echo "sudo 設定"
+		echo "PBSノード: sudo 設定"
 		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo cat /etc/sudoers | grep $USERNAME" > sudotmp
 		sudotmp=$(cat ./sudotmp)
 		if [ -z "$sudotmp" ]; then
 			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "echo "$USERNAME ALL=NOPASSWD: ALL" | sudo tee -a /etc/sudoers"
 		fi
 		unset sudotmp && rm ./sudotmp
+
 		# PBSノード：ディスクフォーマット
 		echo "pbsnode: /dev/sdc disk formatting"
-		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "df | grep sdc1" > tmpformat
-		tmpformat=$(cat ./tmpformat)
-		if [ -z "$tmpformat" ]; then
-			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo parted /dev/sdc --script mklabel gpt mkpart xfspart xfs 0% 100%"
-			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo mkfs.xfs /dev/sdc1"
-			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo partprobe /dev/sdc1"
+		diskformat=$(ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "df | grep sdc1")
+		echo "diskformat: $diskformat"
+		# リモートの /dev/sdc が存在する
+		diskformat2=$(ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo ls /dev/sdc")
+		if [ -n "$diskformat2" ]; then
+			# かつ、 /dev/sdc1 が存在しない場合のみ実施
+			diskformat3=$(ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo ls /dev/sdc1")
+			if [ -z "$diskformat3" ]; then
+				# /dev/sdc1が存在しない場合のみ実施
+				# リモートの /dev/sdc が未フォーマットであるか
+				disktype1=$(ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo fdisk -l /dev/sdc | grep 'Disk label typ'")
+				disktype2=$(ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo fdisk -l /dev/sdc | grep 'Disk identifier'")
+				# どちらも存在しない場合、フォーマット処理	
+				if [ -z "$disktype1" ] && [ -z "$disktype2" ] ; then 
+					ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo parted /dev/sdc --script mklabel gpt mkpart xfspart xfs 0% 100%"
+					ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo mkfs.xfs /dev/sdc1"
+					ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo partprobe /dev/sdc1"
+				fi
+			fi			
 		fi
-		rm ./tmpformat
+		echo "pbsnode: fromatted a new disk."
+		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "df | grep sdc1"
+		unset diskformat && unset diskformat2 && unset diskformat3
+
+		# fstab設定
+		echo "pbsnode: setting fstab"
+		#pbsvmip=$(az vm show -d -g $MyResourceGroup --name ${VMPREFIX}-pbs --query publicIps -o tsv)
+		for cnt in $(seq 1 10); do
+			checkssh=$(ssh -o StrictHostKeyChecking=no -o 'ConnectTimeout 5' -i "${SSHKEYDIR}" -t $USERNAME@"${pbsvmip}" "uname")
+			if [ -n "$checkssh" ]; then
+				break
+			fi
+			echo "waiting sshd @ ${VMPREFIX}-${count}: sleep 10" && sleep 10
+		done
+		if [ -n "$checkssh" ]; then
+			# 重複していないかチェック
+			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@${pbsvmip} -t -t "sudo grep '/dev/sdc1' /etc/fstab" > checkfstabpbs
+			checkfstabpbs=$(cat checkfstabpbs | wc -l)
+			if [ $((checkfstabpbs)) -ge 2 ]; then 
+				echo "pbsnode: deleting dupulicated settings...."
+				ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo sed -i -e '/\/dev/sdc1    \/mnt\/share/d' /etc/fstab"
+				ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo sed -i -e '$ a /dev/sdc1    /mnt/share' /etc/fstab"
+			elif [ $((checkfstabpbs)) -eq 1 ]; then
+				echo "pbsnode: correct fstab setting"
+			elif [ $((checkfstabpbs)) -eq 0 ]; then
+				echo "pbsnode: fstab missing - no /dev/sdc1 here!"
+				ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo sed -i -e '$ a /dev/sdc1    /mnt/share' /etc/fstab"
+			fi
+		else
+			# fstab 設定: az vm run-command
+			echo "pbsnode: configuring fstab by az vm run-command"
+			# 重複していないかチェック
+			az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${pbsvmip}" --command-id RunShellScript --scripts "sudo grep /dev/sdc1 /etc/fstab" > checkfstabpbs
+			checkfstabpbs=$(cat checkfstabpbs | wc -l)
+			if [ $((checkfstabpbs)) -ge 2 ]; then 
+				echo "pbsnode: deleting dupulicated settings...."
+				az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${pbsvmip}" --command-id RunShellScript --scripts "sudo sed -i -e '/\/dev/sdc1    \/mnt\/share/d' /etc/fstab"
+				az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${pbsvmip}" --command-id RunShellScript --scripts "sudo sed -i -e '$ a /dev/sdc1    /mnt/share' /etc/fstab"
+			elif [ $((checkfstabpbs)) -eq 1 ]; then
+				echo "pbsnode: correct fstab setting"
+			elif [ $((checkfstabpbs)) -eq 0 ]; then
+				echo "pbsnode: fstab missing: no /mnt/share here!"
+				az vm run-command invoke -g $MyResourceGroup --name ${VMPREFIX}-"${pbsvmip}" --command-id RunShellScript --scripts "sudo sed -i -e '$ a /dev/sdc1    /mnt/share' /etc/fstab"
+			fi
+		fi
+
 		# PBSノード：ディレクトリ設定
 		echo "pbsnode: data directory setting"
 		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo mkdir -p /mnt/share"
-		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo mount $DEBUG /dev/sdc1 /mnt/share"
+		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo mount /dev/sdc1 /mnt/share"
 		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo chown $USERNAME:$USERNAME /mnt/share"
 		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "ls -la /mnt"
 		# NFS設定
@@ -1598,9 +1695,9 @@ EOL
 			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo cp /etc/hosts /etc/hosts.original"
 		fi
 		rm hostsoriginal
-		# ホストファイルの重複排除
+		# ホストファイルの追加（重複チェック）
 		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "cat /home/$USERNAME/hostsfile | sudo tee -a /etc/hosts"
-		rm ./duplines.sh
+		if [ -f ./duplines.sh ]; then rm ./duplines; fi
 cat <<'EOL' >> duplines.sh
 #!/bin/bash 
 lines=$(sudo cat /etc/hosts | wc -l)
@@ -1609,11 +1706,11 @@ USERNAME=
 if [ $((lines)) -ge $((MAXVM+2)) ]; then
     sudo awk '!colname[$2]++{print $1, "\t" ,$2}' /etc/hosts > /home/$USERNAME/hosts2
 	if [ -s /home/$USERNAME/hosts2 ]; then
-		echo "test...."
+		echo "-s: copy hosts2 to host...."
 		sudo cp /home/$USERNAME/hosts2 /etc/hosts
 	fi
 	if [ ! -f /home/$USERNAME/hosts2 ]; then
-		echo "test2...."
+		echo "!-f: copy hosts2 to host...."
 		sudo sort -V -k 2 /etc/hosts | uniq > /etc/hosts2
 		sudo cp /home/$USERNAME/hosts2 /etc/hosts
 	fi
@@ -1637,8 +1734,8 @@ EOL
 		parallel -a ipaddresslist "scp -o StrictHostKeyChecking=no -o 'ConnectTimeout 360' -i ${SSHKEYDIR} ./openpbs-execution-20.0.1-0.x86_64.rpm $USERNAME@{}:/home/$USERNAME/"
 		# ダウンロード、およびMD5チェック
 		count=0
-		rm ./md5executionremote
-		rm ./md5executionremote2
+		if [ -f ./md5executionremote ]; then rm ./md5executionremote; fi
+		if [ -f ./md5executionremote2 ]; then rm ./md5executionremote2; fi
 		for count in $(seq 1 $MAXVM); do
 			line=$(sed -n "${count}"P ./ipaddresslist)
 			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "md5sum /home/$USERNAME/openpbs-execution-20.0.1-0.x86_64.rpm | cut -d ' ' -f 1" > md5executionremote
@@ -1718,36 +1815,16 @@ EOL
 			# ホストファイルの重複排除
 			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "cat /home/$USERNAME/hostsfile | sudo tee -a /etc/hosts"
 			if [ ! -f ./duplines.sh ]; then 
-cat <<'EOL' >> duplines.sh
-#!/bin/bash 
-lines=$(sudo cat /etc/hosts | wc -l)
-MAXVM=
-USERNAME=
-if [ $((lines)) -ge $((MAXVM+2)) ]; then
-    sudo awk '!colname[$2]++{print $1, "\t" ,$2}' /etc/hosts > /home/$USERNAME/hosts2
-	if [ -s /home/$USERNAME/hosts2 ]; then
-		echo "test...."
-		sudo cp /home/$USERNAME/hosts2 /etc/hosts
-	fi
-	if [ ! -f /home/$USERNAME/hosts2 ]; then
-		echo "test2...."
-		sudo sort -V -k 2 /etc/hosts | uniq > /etc/hosts2
-		sudo cp /home/$USERNAME/hosts2 /etc/hosts
-	fi
-else
-	echo "skip"
-fi
-EOL
+				echo "error!: duplines.sh was deleted. please retry addlogin command."
+			fi
 				sed -i -e "s/MAXVM=/MAXVM=${MAXVM}/" duplines.sh
 				sed -i -e "s/USERNAME=/USERNAME=${USERNAME}/" duplines.sh
-			fi
 			scp -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" ./duplines.sh $USERNAME@"${line}":/home/$USERNAME/
 			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "sudo bash /home/$USERNAME/duplines.sh"
 			echo "${VMPREFIX}-${count}: show /etc/hosts"
 			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "sudo cat /etc/hosts | grep ${VMPREFIX}"
 			ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${line}" -t -t "sudo rm -rf /home/$USERNAME/hosts2"
 		done
-
 ### ===========================================================================
 		# PBSプロセス起動
 		# PBSノード起動＆$USERNAME環境変数設定
@@ -1769,7 +1846,7 @@ EOL
 ### ===========================================================================
 		# PBSジョブスケジューラセッティング
 		echo "configpuring PBS settings"
-		rm ./setuppbs.sh
+		if [ -f ./setuppbs.sh ]; then rm ./setuppbs.sh; fi
 		for count in $(seq 1 $MAXVM); do
 			echo "/opt/pbs/bin/qmgr -c "create node ${VMPREFIX}-${count}"" >> setuppbs.sh
 		done
@@ -1785,11 +1862,11 @@ EOL
 		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" $USERNAME@"${pbsvmip}" -t -t "sudo cp /home/$USERNAME/.ssh/authorized_keys /root/.ssh/authorized_keys"
 		# ジョブスケジューラセッティング
 		ssh -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" root@"${pbsvmip}" -t -t "bash /home/$USERNAME/setuppbs.sh"
-		### ===========================================================================
+### ===========================================================================
 		# 追加機能：PBSノードにnodelistを転送する
 		scp -o StrictHostKeyChecking=no -i "${SSHKEYDIR}" ./nodelist $USERNAME@"${pbsvmip}":/home/$USERNAME/
 		# PBSノードからマウンド状態をチェックするスクリプト生成
-		rm checknfs.sh
+		if [ -f ./checknfs.sh ]; then rm checknfs.sh; fi
 		cat <<'EOL' >> checknfs.sh
 #!/bin/bash
 
@@ -1829,6 +1906,8 @@ fi
 
 ssh -i $SSHKEYDIR $USERNAME@${vm1ip} -t -t 'sudo showmount -e'
 parallel -v -a ./ipaddresslist "ssh -i $SSHKEYDIR $USERNAME@{} -t -t 'df -h | grep 10.0.0.'"
+echo "====================================================================================="
+parallel -v -a ./ipaddresslist "ssh -i $SSHKEYDIR $USERNAME@{} -t -t 'sudo cat /etc/fstab'"
 EOL
 		VMPREFIX=$(grep "VMPREFIX=" "${CMDNAME}" | head -n 1 | cut -d "=" -f 2)
 		sed -i -e "s/^#VMPREFIX=sample/VMPREFIX=$VMPREFIX/" ./checknfs.sh
